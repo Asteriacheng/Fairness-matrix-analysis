@@ -1,0 +1,693 @@
+---
+title: "ST313_Project_2"
+author: "Tianjiao Cheng"
+date: "2026-01-14"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE)
+```
+
+```{r packages}
+# =========================
+# Install packages
+# =========================
+
+library(readxl)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(forcats)
+library(ggplot2)
+library(skimr)
+library(naniar)
+library(rsample)
+library(yardstick)
+library(broom)
+library(pROC)
+library(purrr)
+
+set.seed(123) # We can change the number inside to produce other samples. This ensures reproducibility.
+```
+
+```{r sampling_5000}
+# =========================
+# 1) Create and save a sample of 5,000
+# =========================
+# Run this section to generate the sample from the full dataset.
+# application_train <- read_excel("application_train.xlsx")
+# n_sample <- 5000
+# stopifnot(nrow(application_train) >= n_sample)
+# set.seed(123)
+# sample_idx <- sample.int(n = nrow(application_train), size = n_sample, replace = FALSE)
+# application_train_5000 <- application_train[sample_idx, ]
+# 
+# dplyr::glimpse(application_train_5000)
+# summary(application_train_5000$TARGET)
+# 
+# # install.packages("writexl")  # do NOT install during knitting
+# library(writexl)
+# write_xlsx(application_train_5000, "application_train_sample5000.xlsx")
+```
+
+```{r load_data}
+# ============================
+# 2) Load data and create data dictionary
+# ============================
+data_path <- "HomeCredit Data/application_train_sample5000.xlsx"
+dict_path <- "HomeCredit Data/HomeCredit_columns_description.csv"
+
+df_raw <- readxl::read_excel(data_path)
+
+dict <- readr::read_csv(
+  dict_path,
+  locale = locale(encoding = "latin1"),
+  show_col_types = FALSE
+)
+
+dplyr::glimpse(df_raw)
+
+data_dictionary <- dict %>%
+  filter(Row %in% names(df_raw)) %>%
+  select(Table, Row, Description)
+
+head(data_dictionary, 15)
+```
+
+```{r select_and_clean}
+# =========================
+# 3) Extract key variables
+# =========================
+vars_keep <- c(
+  "SK_ID_CURR","TARGET",
+  # loan
+  "AMT_INCOME_TOTAL","AMT_CREDIT","AMT_ANNUITY","AMT_GOODS_PRICE","NAME_CONTRACT_TYPE",
+  "CNT_FAM_MEMBERS","CNT_CHILDREN",
+  # sensitive / demographic attributes
+  "CODE_GENDER","DAYS_BIRTH","NAME_EDUCATION_TYPE","NAME_FAMILY_STATUS","NAME_HOUSING_TYPE",
+  "REGION_RATING_CLIENT","REGION_RATING_CLIENT_W_CITY","REGION_POPULATION_RELATIVE",
+  # stability variables
+  "DAYS_EMPLOYED","DAYS_REGISTRATION","DAYS_ID_PUBLISH","FLAG_OWN_CAR","FLAG_OWN_REALTY",
+  # external scores + social circle risk
+  "EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3",
+  "OBS_30_CNT_SOCIAL_CIRCLE","DEF_30_CNT_SOCIAL_CIRCLE",
+  "OBS_60_CNT_SOCIAL_CIRCLE","DEF_60_CNT_SOCIAL_CIRCLE"
+)
+
+df <- df_raw %>%
+  select(any_of(vars_keep))
+
+# =====================
+# 4) Data cleaning
+# =====================
+df <- df %>%
+  mutate(
+    AGE_YEARS = (-DAYS_BIRTH) / 365.25,
+
+    DAYS_EMPLOYED_CLEAN = ifelse(DAYS_EMPLOYED == 365243, NA, DAYS_EMPLOYED),
+    EMPLOY_YEARS = (-DAYS_EMPLOYED_CLEAN) / 365.25,
+
+    REG_YEARS = (-DAYS_REGISTRATION) / 365.25,
+    ID_PUBLISH_YEARS = (-DAYS_ID_PUBLISH) / 365.25,
+    
+    AGE_GROUP = cut(
+      AGE_YEARS,
+      breaks = c(-Inf, 35, 50, Inf),
+      labels = c("Under35","35to50","Over50"),
+      right = FALSE
+    ),
+
+    CODE_GENDER = na_if(CODE_GENDER, "XNA"),
+
+    FLAG_OWN_CAR = as.character(FLAG_OWN_CAR),
+    FLAG_OWN_REALTY = as.character(FLAG_OWN_REALTY),
+
+    TARGET = as.integer(TARGET),
+    TARGET_F = factor(TARGET, levels = c(0,1), labels = c("NoDefault","Default"))
+  )
+
+summary(df$AGE_YEARS)
+table(df$TARGET_F, useNA = "ifany")
+```
+
+```{r eda_missingness}
+# =========================
+# 5) Missingness & basic EDA
+# =========================
+miss_tbl <- df %>%
+  summarise(across(everything(), ~mean(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "missing_rate") %>%
+  arrange(desc(missing_rate))
+
+head(miss_tbl, 15)
+
+naniar::gg_miss_var(df) + ggtitle("Missingness by variable")
+
+df %>%
+  summarise(default_rate = mean(TARGET, na.rm = TRUE)) %>%
+  print()
+
+df %>%
+  group_by(CODE_GENDER) %>%
+  summarise(n = n(), default_rate = mean(TARGET, na.rm = TRUE), .groups="drop") %>%
+  print()
+
+df %>%
+  group_by(AGE_GROUP) %>%
+  summarise(n = n(), default_rate = mean(TARGET, na.rm = TRUE), .groups="drop") %>%
+  print()
+
+ggplot(df, aes(x = TARGET_F)) +
+  geom_bar() +
+  ggtitle("Class balance (TARGET)")
+
+ggplot(df, aes(x = CODE_GENDER, fill = TARGET_F)) +
+  geom_bar(position = "fill") +
+  ylab("Proportion") +
+  ggtitle("Default rate by gender (proportion)")
+
+ggplot(df, aes(x = AGE_YEARS, fill = TARGET_F)) +
+  geom_histogram(bins = 30, position = "identity", alpha = 0.6) +
+  ggtitle("Age distribution by TARGET")
+```
+
+```{r split}
+# =======================
+# 6) Train and test split
+# =======================
+split <- initial_split(df %>% filter(!is.na(TARGET_F)), prop = 0.8, strata = TARGET_F)
+train <- training(split)
+test  <- testing(split)
+
+protected_lookup_test <- test %>%
+  select(SK_ID_CURR, AGE_GROUP)
+```
+
+```{r preprocess_no_leakage}
+# =======================================
+# 7) Train-fitted pre-processing 
+# =======================================
+mode_val <- function(x){
+  ux <- na.omit(x)
+  if(length(ux) == 0) return(NA)
+  names(sort(table(ux), decreasing = TRUE))[1]
+}
+
+fit_preprocess <- function(train_df, feature_names){
+  dat <- train_df %>% select(all_of(feature_names))
+
+  num_cols <- names(dat)[sapply(dat, is.numeric)]
+  cat_cols <- setdiff(names(dat), num_cols)
+
+  medians <- sapply(dat[num_cols], function(z) median(z, na.rm = TRUE))
+  modes   <- sapply(dat[cat_cols], mode_val)
+  levels_list <- lapply(dat[cat_cols], function(z) levels(factor(z)))
+
+  list(
+    feature_names = feature_names,
+    num_cols = num_cols,
+    cat_cols = cat_cols,
+    medians = medians,
+    modes = modes,
+    levels_list = levels_list
+  )
+}
+
+apply_preprocess <- function(df, prep, keep_cols = c("SK_ID_CURR","TARGET","TARGET_F")){
+  dat <- df %>% select(any_of(c(keep_cols, prep$feature_names)))
+
+  # numeric impute (train medians)
+  for(nm in prep$num_cols){
+    if(nm %in% names(dat)){
+      dat[[nm]] <- ifelse(is.na(dat[[nm]]), prep$medians[[nm]], dat[[nm]])
+    }
+  }
+
+  # categorical impute (train modes) + enforce train levels
+  # unseen -> "Other"
+  for(nm in prep$cat_cols){
+    if(nm %in% names(dat)){
+      x <- as.character(dat[[nm]])
+      x[is.na(x)] <- prep$modes[[nm]]
+
+      train_levels <- prep$levels_list[[nm]]
+      x[!x %in% train_levels] <- "Other"
+
+      dat[[nm]] <- factor(x, levels = unique(c(train_levels, "Other")))
+    }
+  }
+
+  dat
+}
+
+```
+
+```{r features_and_models}
+# =====================================
+# 8) Define Baseline and Extended feature sets
+# =====================================
+baseline_features <- c(
+  "AGE_YEARS",
+  "AMT_INCOME_TOTAL","AMT_CREDIT","AMT_ANNUITY","AMT_GOODS_PRICE",
+  "NAME_CONTRACT_TYPE",
+  "CNT_FAM_MEMBERS","CNT_CHILDREN",
+  "EMPLOY_YEARS",
+  "REG_YEARS","ID_PUBLISH_YEARS",
+  "FLAG_OWN_CAR","FLAG_OWN_REALTY"
+)
+
+extended_features <- c(
+  baseline_features,
+  "CODE_GENDER","NAME_EDUCATION_TYPE","NAME_FAMILY_STATUS","NAME_HOUSING_TYPE",
+  "REGION_RATING_CLIENT","REGION_RATING_CLIENT_W_CITY","REGION_POPULATION_RELATIVE",
+  "EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3",
+  "OBS_30_CNT_SOCIAL_CIRCLE","DEF_30_CNT_SOCIAL_CIRCLE",
+  "OBS_60_CNT_SOCIAL_CIRCLE","DEF_60_CNT_SOCIAL_CIRCLE"
+)
+
+prep_base <- fit_preprocess(train, baseline_features)
+prep_ext  <- fit_preprocess(train, extended_features)
+
+train_base <- apply_preprocess(train, prep_base)
+test_base  <- apply_preprocess(test,  prep_base)
+
+train_ext <- apply_preprocess(train, prep_ext)
+test_ext  <- apply_preprocess(test,  prep_ext)
+
+# =============================
+# 9) Fit logistic regression models
+# =============================
+m_base <- glm(
+  TARGET ~ .,
+  data = train_base %>% select(-TARGET_F, -SK_ID_CURR),
+  family = binomial()
+)
+
+m_ext <- glm(
+  TARGET ~ .,
+  data = train_ext %>% select(-TARGET_F, -SK_ID_CURR),
+  family = binomial()
+)
+
+summary(m_base)
+summary(m_ext)
+```
+
+```{r evaluation}
+# =================================
+# 10) Predict and evaluate the model
+# =================================
+eval_model <- function(model, test_dat, threshold = 0.5){
+  p <- predict(model, newdata = test_dat %>% select(all_of(setdiff(names(test_dat), c("SK_ID_CURR","TARGET","TARGET_F")))), type = "response")
+
+  out <- test_dat %>%
+    mutate(
+      pred_prob = as.numeric(p),
+      pred_class = factor(
+        ifelse(pred_prob >= threshold, "Default", "NoDefault"),
+        levels = c("NoDefault","Default")
+      )
+    )
+
+  auc_val <- yardstick::roc_auc_vec(
+    truth = out$TARGET_F,
+    estimate = out$pred_prob,
+    event_level = "second"
+  )
+  auc <- tibble(.metric = "roc_auc", .estimate = auc_val)
+
+  cm <- yardstick::conf_mat(out, truth = TARGET_F, estimate = pred_class)
+  metrics <- yardstick::metric_set(accuracy, sens, spec, f_meas)(
+    out, truth = TARGET_F, estimate = pred_class
+  )
+
+  list(pred = out, auc = auc, cm = cm, metrics = metrics)
+}
+
+res_base <- eval_model(m_base, test_base, threshold = 0.5)
+res_ext  <- eval_model(m_ext,  test_ext,  threshold = 0.5)
+
+res_base$auc
+res_ext$auc
+
+res_base$metrics
+res_ext$metrics
+
+res_base$cm
+res_ext$cm
+
+plot_roc <- function(res, title){
+  roc_obj <- pROC::roc(response = res$pred$TARGET, predictor = res$pred$pred_prob, quiet = TRUE)
+  plot(roc_obj, main = title)
+  abline(a = 0, b = 1, lty = 2)
+}
+plot_roc(res_base, "ROC - Baseline logistic regression")
+plot_roc(res_ext,  "ROC - Extended logistic regression")
+```
+
+```{r fairness_by_group_simple}
+# ==================================
+# 11) Fairness metrics by group
+# ==================================
+pred_ext <- res_ext$pred %>%
+  left_join(protected_lookup_test, by = "SK_ID_CURR")
+
+# quick check
+stopifnot("CODE_GENDER" %in% names(pred_ext))
+stopifnot("REGION_RATING_CLIENT" %in% names(pred_ext))
+stopifnot("AGE_GROUP" %in% names(pred_ext))
+
+group_fairness <- function(pred_df, group_var, threshold = 0.5){
+  if(!(group_var %in% names(pred_df))){
+    stop(paste0("'", group_var, "' not found. Available columns include: ",
+                paste(names(pred_df), collapse = ", "),
+                ". (Often caused by left_join suffixes .x/.y.)"))
+  }
+
+  d <- pred_df %>%
+    mutate(
+      pred = ifelse(pred_prob >= threshold, 1, 0),  # 1 = predicted default
+      grp = .data[[group_var]]
+    ) %>%
+    filter(!is.na(grp))
+
+  g <- d %>%
+    group_by(grp) %>%
+    summarise(
+      n = n(),
+      base_rate = mean(TARGET),
+      pos_pred_rate = mean(pred),
+      TP = sum(pred == 1 & TARGET == 1),
+      FP = sum(pred == 1 & TARGET == 0),
+      TN = sum(pred == 0 & TARGET == 0),
+      FN = sum(pred == 0 & TARGET == 1),
+      TPR = ifelse((TP + FN) == 0, NA, TP/(TP+FN)),
+      FPR = ifelse((FP + TN) == 0, NA, FP/(FP+TN)),
+      FNR = ifelse((TP + FN) == 0, NA, FN/(TP+FN)),
+      .groups = "drop"
+    ) %>%
+    arrange(grp)
+
+  gaps <- g %>%
+    summarise(
+      demographic_parity_gap = max(pos_pred_rate, na.rm=TRUE) - min(pos_pred_rate, na.rm=TRUE),
+      equal_opportunity_gap  = max(TPR, na.rm=TRUE) - min(TPR, na.rm=TRUE),
+      equalized_odds_FPR_gap = max(FPR, na.rm=TRUE) - min(FPR, na.rm=TRUE)
+    )
+
+  list(by_group = g, gaps = gaps)
+}
+
+fair_gender <- group_fairness(pred_ext, "CODE_GENDER", threshold = 0.5)
+fair_age    <- group_fairness(pred_ext, "AGE_GROUP", threshold = 0.5)
+fair_region <- group_fairness(pred_ext, "REGION_RATING_CLIENT", threshold = 0.5)
+
+fair_gender$by_group; fair_gender$gaps
+fair_age$by_group;    fair_age$gaps
+fair_region$by_group; fair_region$gaps
+```
+
+```{r threshold_tradeoff_simple}
+# ==================================
+# 12) Threshold trade-offs (accuracy vs fairness gaps)
+# ==================================
+threshold_grid <- seq(0.05, 0.95, by = 0.05)
+
+tradeoff <- lapply(threshold_grid, function(th){
+  tmp <- pred_ext %>%
+    mutate(pred_class = factor(ifelse(pred_prob >= th, "Default","NoDefault"),
+                               levels = c("NoDefault","Default")))
+  acc <- yardstick::accuracy(tmp, truth = TARGET_F, estimate = pred_class)$.estimate
+
+  fg <- group_fairness(pred_ext, "CODE_GENDER", threshold = th)$gaps
+
+  data.frame(
+    threshold = th,
+    accuracy = acc,
+    demographic_parity_gap = fg$demographic_parity_gap,
+    equal_opportunity_gap  = fg$equal_opportunity_gap,
+    equalized_odds_FPR_gap = fg$equalized_odds_FPR_gap
+  )
+}) %>% bind_rows()
+
+tradeoff
+
+ggplot(tradeoff, aes(x = threshold, y = accuracy)) +
+  geom_line() +
+  ggtitle("Extended model: Accuracy vs threshold")
+
+ggplot(tradeoff, aes(x = threshold, y = equal_opportunity_gap)) +
+  geom_line() +
+  ggtitle("Extended model: Equal opportunity gap (gender) vs threshold")
+
+ggplot(tradeoff, aes(x = threshold, y = demographic_parity_gap)) +
+  geom_line() +
+  ggtitle("Extended model: Demographic parity gap (gender) vs threshold")
+```
+
+```{r calibration_overall}
+# =========================
+# 13) Calibration plot (overall)
+# =========================
+calibration <- pred_ext %>%
+  mutate(bin = ntile(pred_prob, 10)) %>%
+  group_by(bin) %>%
+  summarise(
+    mean_pred = mean(pred_prob),
+    obs_rate  = mean(TARGET),
+    n = n(),
+    .groups="drop"
+  )
+
+ggplot(calibration, aes(x = mean_pred, y = obs_rate)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  ggtitle("Calibration (deciles) - Extended model") +
+  xlab("Mean predicted probability") +
+  ylab("Observed default rate")
+```
+
+```{r fairness_audit_full}
+# ==================================
+# 14) Fairness Audit (full metrics + disparities)
+# ==================================
+
+POS_LABEL <- 1
+THRESH <- 0.50
+
+audit_df <- pred_ext %>%
+  mutate(
+    y_true = as.integer(TARGET),
+    score  = as.numeric(pred_prob),
+    y_hat_default = as.integer(score >= THRESH), # undesirable outcome (default)
+    y_hat_approve = as.integer(score < THRESH)  # beneficial outcome (approval)
+  ) %>%
+  filter(!is.na(y_true), !is.na(score))
+
+audit_df <- audit_df %>%
+  mutate(
+    REGION_RATING_CLIENT = factor(
+      REGION_RATING_CLIENT,
+      levels = sort(unique(REGION_RATING_CLIENT)),
+      labels = paste0("Region rating: ", sort(unique(REGION_RATING_CLIENT)))
+    )
+  )
+
+conf_metrics <- function(df, thresh = 0.5, pos_label = 1){
+  y_true_bin <- as.integer(df$y_true == pos_label)
+
+  # default prediction (1 = predicted default)
+  y_hat_default <- as.integer(df$score >= thresh)
+
+  TP <- sum(y_hat_default == 1 & y_true_bin == 1, na.rm = TRUE)
+  FP <- sum(y_hat_default == 1 & y_true_bin == 0, na.rm = TRUE)
+  TN <- sum(y_hat_default == 0 & y_true_bin == 0, na.rm = TRUE)
+  FN <- sum(y_hat_default == 0 & y_true_bin == 1, na.rm = TRUE)
+
+  base_rate <- mean(y_true_bin == 1, na.rm = TRUE)
+
+  # beneficial decision: approve if not flagged as default
+  approval_rate <- mean(df$score < thresh, na.rm = TRUE)
+
+  TPR <- ifelse(TP + FN == 0, NA, TP/(TP+FN))
+  FPR <- ifelse(FP + TN == 0, NA, FP/(FP+TN))
+  PPV <- ifelse(TP + FP == 0, NA, TP/(TP+FP))
+  NPV <- ifelse(TN + FN == 0, NA, TN/(TN+FN))
+  ACC <- mean(y_hat_default == y_true_bin, na.rm = TRUE)
+
+  tibble(
+    n = nrow(df),
+    base_rate = base_rate,
+    approval_rate = approval_rate,
+    TP = TP, FP = FP, TN = TN, FN = FN,
+    TPR = TPR, FPR = FPR, PPV = PPV, NPV = NPV,
+    ACC = ACC
+  )
+}
+
+add_disparities <- function(tbl, group_col){
+  ref <- tbl %>% arrange(desc(n)) %>% slice(1) %>% pull(!!sym(group_col))
+  ref_row <- tbl %>% filter((!!sym(group_col)) == ref)
+
+  tbl %>%
+    mutate(
+      ref_group = ref,
+      DI_ratio = ifelse(as.numeric(ref_row$approval_rate) == 0, NA, approval_rate / as.numeric(ref_row$approval_rate)),
+      DP_diff  = approval_rate - as.numeric(ref_row$approval_rate),
+      EO_diff  = TPR - as.numeric(ref_row$TPR),
+      FPR_diff = FPR - as.numeric(ref_row$FPR),
+      PPV_diff = PPV - as.numeric(ref_row$PPV)
+    )
+}
+
+report_group_fairness <- function(df, group_var, thresh = 0.5){
+  out <- df %>%
+    filter(!is.na(.data[[group_var]])) %>%
+    group_by(.data[[group_var]]) %>%
+    group_modify(~ conf_metrics(.x, thresh = thresh, pos_label = POS_LABEL)) %>%
+    ungroup() %>%
+    rename(group = !!sym(group_var))
+
+  out2 <- add_disparities(out, "group")
+  list(by_group = out2)
+}
+
+protected_vars <- c("CODE_GENDER", "AGE_GROUP", "REGION_RATING_CLIENT")
+
+for(g in protected_vars){
+  cat("\n--- Counts + base rate by", g, "---\n")
+  print(
+    audit_df %>%
+      filter(!is.na(.data[[g]])) %>%
+      group_by(.data[[g]]) %>%
+      summarise(
+        n = n(),
+        base_rate = mean(y_true == POS_LABEL),
+        mean_score = mean(score),
+        .groups = "drop"
+      ) %>%
+      arrange(desc(n))
+  )
+
+  ggplot(audit_df %>% filter(!is.na(.data[[g]])),
+         aes(x = score, fill = .data[[g]])) +
+    geom_histogram(bins = 30, position = "identity", alpha = 0.5) +
+    geom_vline(xintercept = THRESH, linetype = "dashed", linewidth = 0.8) +
+    labs(title = paste("Score distribution by", g),
+         x = "Predicted default probability",
+         y = "Count") +
+    theme_minimal() -> p
+  print(p)
+}
+
+cat("\nThreshold =", THRESH, "(predict Default if score >= threshold)\n")
+
+overall <- conf_metrics(audit_df, thresh = THRESH, pos_label = POS_LABEL)
+cat("\n--- Overall metrics ---\n")
+print(overall)
+
+for(g in protected_vars){
+  cat("\n--- Metrics by", g, "---\n")
+  rep <- report_group_fairness(audit_df, g, thresh = THRESH)
+  print(rep$by_group %>% select(group, n, base_rate, approval_rate, TPR, FPR, PPV, ACC))
+}
+
+for(g in protected_vars){
+  cat("\n--- 80% rule check for", g, "(DI_ratio < 0.8 flagged) ---\n")
+  rep <- report_group_fairness(audit_df, g, thresh = THRESH)
+  print(rep$by_group %>%
+          mutate(flag_80 = DI_ratio < 0.8) %>%
+          select(group, n, approval_rate, ref_group, DI_ratio, flag_80))
+}
+
+threshold_grid <- seq(0.05, 0.95, by = 0.05)
+
+sweep_one <- function(df, group_var){
+  map_dfr(threshold_grid, function(t){
+    tbl <- df %>%
+  filter(!is.na(.data[[group_var]])) %>%
+  group_by(.data[[group_var]]) %>%
+  group_modify(~ conf_metrics(.x, thresh = t, pos_label = POS_LABEL)) %>%
+  ungroup() %>%
+  rename(group = !!sym(group_var)) %>%
+  mutate(threshold = t)
+
+    tbl %>%
+      summarise(
+        selection_gap = max(approval_rate, na.rm = TRUE) - min(approval_rate, na.rm = TRUE),
+        TPR_gap = max(TPR, na.rm = TRUE) - min(TPR, na.rm = TRUE),
+        FPR_gap = max(FPR, na.rm = TRUE) - min(FPR, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(threshold = t)
+  }) %>%
+    mutate(group_var = group_var)
+}
+
+sweep_gaps <- bind_rows(
+  sweep_one(audit_df, "CODE_GENDER"),
+  sweep_one(audit_df, "AGE_GROUP"),
+  sweep_one(audit_df, "REGION_RATING_CLIENT")
+)
+
+ggplot(sweep_gaps, aes(x = threshold, y = selection_gap, color = group_var)) +
+  geom_line() +
+  labs(title = "Approval rate gap (demographic parity) vs threshold",
+       x = "Threshold", y = "Max–min approval rate",
+       color = "Protected attribute") +
+  theme_minimal() -> p1
+print(p1)
+
+ggplot(sweep_gaps, aes(x = threshold, y = TPR_gap, color = group_var)) +
+  geom_line() +
+  labs(title = "Equal opportunity gap (TPR) vs threshold",
+       x = "Threshold", y = "Max–min TPR",
+       color = "Protected attribute") +
+  theme_minimal() -> p2
+print(p2)
+
+ggplot(sweep_gaps, aes(x = threshold, y = FPR_gap, color = group_var)) +
+  geom_line() +
+  labs(title = "Equalized odds component gap (FPR) vs threshold",
+       x = "Threshold", y = "Max–min FPR",
+       color = "Protected attribute") +
+  theme_minimal() -> p3
+print(p3)
+
+cal_by_group <- function(df, group_var, bins = 10){
+  df %>%
+    filter(!is.na(.data[[group_var]]), !is.na(score)) %>%
+    mutate(bin = ntile(score, bins)) %>%
+    group_by(.data[[group_var]], bin) %>%
+    summarise(
+      mean_score = mean(score),
+      obs_rate = mean(y_true == POS_LABEL),
+      n = n(),
+      .groups = "drop"
+    ) %>%
+    rename(group = !!sym(group_var))
+}
+
+for(g in protected_vars){
+  cal_tbl <- cal_by_group(audit_df, g, bins = 10)
+
+  ggplot(cal_tbl, aes(x = mean_score, y = obs_rate, group = group)) +
+    geom_line() +
+    geom_point() +
+    geom_abline(slope = 1, intercept = 0, lty = 2) +
+    labs(title = paste("Calibration by", g),
+         x = "Mean predicted probability (bin)",
+         y = "Observed default rate (bin)") +
+    theme_minimal() -> p
+  print(p)
+}
+```
+
+```{r reproducibility}
+# =========================
+# 15) Reproducibility info
+# =========================
+sessionInfo()
+```
